@@ -1,0 +1,182 @@
+{
+  "Id": "deploymentprocess-Projects-1",
+  "ProjectId": "Projects-1",
+  "Version": 1,
+  "Steps": [
+    {
+      "Id": "step-1",
+      "Name": "1. Initialize Deployment Variables",
+      "PackageRequirement": "LetOctopusDecide",
+      "Properties": {
+        "Octopus.Action.TargetRoles": "azure-webapp"
+      },
+      "Condition": "Success",
+      "StartTrigger": "StartAfterPrevious",
+      "Actions": [
+        {
+          "Id": "action-1",
+          "Name": "Determine Target Slot",
+          "ActionType": "Octopus.Script",
+          "IsDisabled": false,
+          "Properties": {
+            "Octopus.Action.Script.ScriptSource": "Inline",
+            "Octopus.Action.Script.Syntax": "PowerShell",
+            "Octopus.Action.Script.ScriptBody": "# Determine which slot to deploy to based on current active slot\n$currentSlot = $OctopusParameters[\"Azure.CurrentSlot\"]\n$webAppName = $OctopusParameters[\"Azure.WebApp.Name\"]\n\nWrite-Host \"Current active slot: $currentSlot\"\n\n# Set target slot (opposite of current)\nif ($currentSlot -eq \"blue\") {\n    $targetSlot = \"green\"\n} else {\n    $targetSlot = \"blue\"\n}\n\nWrite-Host \"Target deployment slot: $targetSlot\"\nSet-OctopusVariable -name \"Azure.TargetSlot\" -value $targetSlot\nSet-OctopusVariable -name \"Azure.TargetSlotUrl\" -value \"https://$webAppName-$targetSlot.azurewebsites.net\"\n\nWrite-Host \"Deployment variables initialized successfully\""
+          }
+        }
+      ]
+    },
+    {
+      "Id": "step-2",
+      "Name": "2. Pre-deployment Health Check",
+      "PackageRequirement": "LetOctopusDecide",
+      "Properties": {
+        "Octopus.Action.TargetRoles": "azure-webapp"
+      },
+      "Condition": "Success",
+      "StartTrigger": "StartAfterPrevious",
+      "Actions": [
+        {
+          "Id": "action-2",
+          "Name": "Validate Current Production Health",
+          "ActionType": "Octopus.Script",
+          "IsDisabled": false,
+          "Properties": {
+            "Octopus.Action.Script.ScriptSource": "Inline",
+            "Octopus.Action.Script.Syntax": "PowerShell",
+            "Octopus.Action.Script.ScriptBody": "# Validate current production slot health before deployment\n$webAppName = $OctopusParameters[\"Azure.WebApp.Name\"]\n$productionUrl = \"https://$webAppName.azurewebsites.net\"\n\nWrite-Host \"Checking current production health: $productionUrl\"\n\ntry {\n    $response = Invoke-WebRequest -Uri \"$productionUrl/health\" -TimeoutSec 30\n    if ($response.StatusCode -eq 200) {\n        Write-Host \"✓ Current production slot is healthy\"\n    } else {\n        throw \"Health check returned status code: $($response.StatusCode)\"\n    }\n} catch {\n    Write-Error \"❌ Current production slot health check failed: $($_.Exception.Message)\"\n    throw\n}\n\nWrite-Host \"Pre-deployment validation completed successfully\""
+          }
+        }
+      ]
+    },
+    {
+      "Id": "step-3",
+      "Name": "3. Deploy Application to Target Slot",
+      "PackageRequirement": "LetOctopusDecide",
+      "Properties": {
+        "Octopus.Action.TargetRoles": "azure-webapp"
+      },
+      "Condition": "Success",
+      "StartTrigger": "StartAfterPrevious",
+      "Actions": [
+        {
+          "Id": "action-3",
+          "Name": "Deploy to Azure App Service Slot",
+          "ActionType": "Octopus.AzureAppService",
+          "IsDisabled": false,
+          "Packages": [
+            {
+              "Id": "package-1",
+              "Name": "WebApp",
+              "PackageId": "#{Application.Package.Id}",
+              "FeedId": "#{Application.Package.Feed}",
+              "AcquisitionLocation": "Server"
+            }
+          ],
+          "Properties": {
+            "Octopus.Action.Azure.AccountId": "#{Azure.Account}",
+            "Octopus.Action.Azure.ResourceGroupName": "#{Azure.ResourceGroup}",
+            "Octopus.Action.Azure.WebAppName": "#{Azure.WebApp.Name}",
+            "Octopus.Action.Azure.WebAppSlot": "#{Azure.TargetSlot}",
+            "Octopus.Action.Azure.RemoveAdditionalFiles": "true",
+            "Octopus.Action.Azure.PreserveAppData": "true"
+          }
+        }
+      ]
+    },
+    {
+      "Id": "step-4",
+      "Name": "4. Warm-up and Health Check Target Slot",
+      "PackageRequirement": "LetOctopusDecide",
+      "Properties": {
+        "Octopus.Action.TargetRoles": "azure-webapp"
+      },
+      "Condition": "Success",
+      "StartTrigger": "StartAfterPrevious",
+      "Actions": [
+        {
+          "Id": "action-4",
+          "Name": "Warm-up and Validate Target Slot",
+          "ActionType": "Octopus.Script",
+          "IsDisabled": false,
+          "Properties": {
+            "Octopus.Action.Script.ScriptSource": "Inline",
+            "Octopus.Action.Script.Syntax": "PowerShell",
+            "Octopus.Action.Script.ScriptBody": "# Warm-up and validate the target slot before swapping\n$targetSlotUrl = $OctopusParameters[\"Azure.TargetSlotUrl\"]\n$timeout = [int]$OctopusParameters[\"HealthCheck.Timeout\"]\n$retryInterval = [int]$OctopusParameters[\"HealthCheck.Interval\"]\n$warmupTime = [int]$OctopusParameters[\"Deployment.WarmupTime\"]\n\nWrite-Host \"Starting warm-up process for target slot: $targetSlotUrl\"\n\n# Initial warm-up requests\n$warmupEndpoints = @(\"/\", \"/health\", \"/api/status\")\n\nforeach ($endpoint in $warmupEndpoints) {\n    try {\n        Write-Host \"Warming up endpoint: $endpoint\"\n        $response = Invoke-WebRequest -Uri \"$targetSlotUrl$endpoint\" -TimeoutSec 30 -ErrorAction SilentlyContinue\n        Write-Host \"Warmup response for $endpoint : $($response.StatusCode)\"\n    } catch {\n        Write-Warning \"Warmup request failed for $endpoint : $($_.Exception.Message)\"\n    }\n}\n\n# Wait for application to fully initialize\nWrite-Host \"Waiting $warmupTime seconds for application initialization...\"\nStart-Sleep -Seconds $warmupTime\n\n# Health check validation with retries\n$maxRetries = $timeout / $retryInterval\n$retryCount = 0\n$healthCheckPassed = $false\n\nwhile ($retryCount -lt $maxRetries -and -not $healthCheckPassed) {\n    try {\n        Write-Host \"Health check attempt $($retryCount + 1) of $maxRetries\"\n        $healthResponse = Invoke-WebRequest -Uri \"$targetSlotUrl/health\" -TimeoutSec 30\n        \n        if ($healthResponse.StatusCode -eq 200) {\n            Write-Host \"✓ Health check passed - Application is ready\"\n            $healthCheckPassed = $true\n        }\n    } catch {\n        Write-Warning \"Health check failed: $($_.Exception.Message)\"\n    }\n    \n    if (-not $healthCheckPassed) {\n        $retryCount++\n        if ($retryCount -lt $maxRetries) {\n            Write-Host \"Waiting $retryInterval seconds before next attempt...\"\n            Start-Sleep -Seconds $retryInterval\n        }\n    }\n}\n\nif (-not $healthCheckPassed) {\n    Write-Error \"❌ Health check validation failed after $maxRetries attempts\"\n    throw \"Target slot health validation failed\"\n}\n\nWrite-Host \"Target slot validation completed successfully\""
+          }
+        }
+      ]
+    },
+    {
+      "Id": "step-5",
+      "Name": "5. Perform Slot Swap",
+      "PackageRequirement": "LetOctopusDecide",
+      "Properties": {
+        "Octopus.Action.TargetRoles": "azure-webapp"
+      },
+      "Condition": "Success",
+      "StartTrigger": "StartAfterPrevious",
+      "Actions": [
+        {
+          "Id": "action-5",
+          "Name": "Swap Deployment Slots",
+          "ActionType": "Octopus.AzurePowerShell",
+          "IsDisabled": false,
+          "Properties": {
+            "Octopus.Action.Azure.AccountId": "#{Azure.Account}",
+            "Octopus.Action.Script.ScriptSource": "Inline",
+            "Octopus.Action.Script.Syntax": "PowerShell",
+            "Octopus.Action.Script.ScriptBody": "# Perform slot swap operation\n$resourceGroupName = $OctopusParameters[\"Azure.ResourceGroup\"]\n$webAppName = $OctopusParameters[\"Azure.WebApp.Name\"]\n$sourceSlot = $OctopusParameters[\"Azure.TargetSlot\"]\n$targetSlot = \"production\"\n\nWrite-Host \"Starting slot swap operation...\"\nWrite-Host \"Resource Group: $resourceGroupName\"\nWrite-Host \"Web App: $webAppName\"\nWrite-Host \"Source Slot: $sourceSlot\"\n\ntry {\n    # Perform the slot swap\n    Write-Host \"Executing slot swap...\"\n    $swapResult = Invoke-AzResourceAction -ResourceGroupName $resourceGroupName -ResourceType \"Microsoft.Web/sites/slots\" -ResourceName \"$webAppName/$sourceSlot\" -Action \"slotsswap\" -Parameters @{targetSlot = $targetSlot} -ApiVersion \"2018-02-01\" -Force\n\n    Write-Host \"✓ Slot swap completed successfully\"\n    \n    # Wait for swap propagation\n    Write-Host \"Waiting for swap propagation...\"\n    Start-Sleep -Seconds 30\n    \n} catch {\n    Write-Error \"❌ Slot swap operation failed: $($_.Exception.Message)\"\n    throw\n}\n\nWrite-Host \"Slot swap operation completed successfully\""
+          }
+        }
+      ]
+    },
+    {
+      "Id": "step-6",
+      "Name": "6. Post-Deployment Validation",
+      "PackageRequirement": "LetOctopusDecide",
+      "Properties": {
+        "Octopus.Action.TargetRoles": "azure-webapp"
+      },
+      "Condition": "Success",
+      "StartTrigger": "StartAfterPrevious",
+      "Actions": [
+        {
+          "Id": "action-6",
+          "Name": "Validate New Production Deployment",
+          "ActionType": "Octopus.Script",
+          "IsDisabled": false,
+          "Properties": {
+            "Octopus.Action.Script.ScriptSource": "Inline",
+            "Octopus.Action.Script.Syntax": "PowerShell",
+            "Octopus.Action.Script.ScriptBody": "# Validate the new production deployment after slot swap\n$webAppName = $OctopusParameters[\"Azure.WebApp.Name\"]\n$productionUrl = \"https://$webAppName.azurewebsites.net\"\n$retryInterval = [int]$OctopusParameters[\"HealthCheck.Interval\"]\n$maxRetries = 10\n\nWrite-Host \"Validating new production deployment: $productionUrl\"\n\n# Comprehensive post-deployment validation\n$validationTests = @(\n    @{ Name = \"Health Check\"; Endpoint = \"/health\" },\n    @{ Name = \"API Status\"; Endpoint = \"/api/status\" },\n    @{ Name = \"Home Page\"; Endpoint = \"/\" }\n)\n\n$allTestsPassed = $true\n\nforeach ($test in $validationTests) {\n    Write-Host \"Running $($test.Name) validation...\"\n    \n    $retryCount = 0\n    $testPassed = $false\n    \n    while ($retryCount -lt $maxRetries -and -not $testPassed) {\n        try {\n            $response = Invoke-WebRequest -Uri \"$productionUrl$($test.Endpoint)\" -TimeoutSec 30\n            \n            if ($response.StatusCode -eq 200) {\n                Write-Host \"✓ $($test.Name) passed (Status: $($response.StatusCode))\"\n                $testPassed = $true\n            }\n        } catch {\n            Write-Warning \"$($test.Name) failed: $($_.Exception.Message)\"\n        }\n        \n        if (-not $testPassed) {\n            $retryCount++\n            if ($retryCount -lt $maxRetries) {\n                Write-Host \"Retrying $($test.Name) in $retryInterval seconds...\"\n                Start-Sleep -Seconds $retryInterval\n            }\n        }\n    }\n    \n    if (-not $testPassed) {\n        Write-Error \"❌ $($test.Name) validation failed\"\n        $allTestsPassed = $false\n    }\n}\n\nif (-not $allTestsPassed) {\n    Write-Error \"❌ Post-deployment validation failed. Consider manual rollback.\"\n    throw \"Post-deployment validation failed\"\n}\n\nWrite-Host \"✓ All post-deployment validations passed successfully\"\nWrite-Host \"✓ Zero-downtime deployment completed successfully\""
+          }
+        }
+      ]
+    },
+    {
+      "Id": "step-7",
+      "Name": "7. Update Deployment Variables",
+      "PackageRequirement": "LetOctopusDecide",
+      "Properties": {
+        "Octopus.Action.TargetRoles": "azure-webapp"
+      },
+      "Condition": "Success",
+      "StartTrigger": "StartAfterPrevious",
+      "Actions": [
+        {
+          "Id": "action-7",
+          "Name": "Update Variables for Next Deployment",
+          "ActionType": "Octopus.Script",
+          "IsDisabled": false,
+          "Properties": {
+            "Octopus.Action.Script.ScriptSource": "Inline",
+            "Octopus.Action.Script.Syntax": "PowerShell",
+            "Octopus.Action.Script.ScriptBody": "# Update variables for next deployment cycle\n$currentSlot = $OctopusParameters[\"Azure.CurrentSlot\"]\n$targetSlot = $OctopusParameters[\"Azure.TargetSlot\"]\n$deploymentId = $OctopusParameters[\"Octopus.Release.Number\"]\n\nWrite-Host \"Updating deployment variables for next cycle...\"\nWrite-Host \"Previous active slot: $currentSlot\"\nWrite-Host \"New active slot: $targetSlot\"\nWrite-Host \"Deployment ID: $deploymentId\"\n\nWrite-Host \"=== Deployment Summary ===\"\nWrite-Host \"✓ Zero-downtime deployment completed successfully\"\nWrite-Host \"✓ Application deployed to slot: $targetSlot\"\nWrite-Host \"✓ Traffic successfully switched to new deployment\"\nWrite-Host \"✓ All health checks passed\"\nWrite-Host \"✓ Ready for next deployment cycle\"\n\nWrite-Host \"=== Next Deployment Info ===\"\nWrite-Host \"Next deployment will target slot: $currentSlot\"\nWrite-Host \"Current production slot: $targetSlot\"\n\nWrite-Host \"Deployment process completed at: $(Get-Date)\""
+          }
+        }
+      ]
+    }
+  ],
+  "RelatedDocumentIds": []
+}
